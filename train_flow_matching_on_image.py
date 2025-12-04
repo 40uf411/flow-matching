@@ -99,6 +99,39 @@ def train(args: ScriptArguments):
     print("GradScaler enabled:", scaler._enabled)
     model_size_summary(flow)
 
+    def save_sample_grid(epoch_num: int) -> None:
+        """Generate and save a 5x5 grid of samples for quick inspection."""
+
+        class WrappedModel(ModelWrapper):
+            def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:  # type: ignore[override]
+                return self.model(x=x, t=t, **extras)
+
+        flow.eval()
+        num_samples = 25
+        sample_steps = 101
+        time_steps = torch.linspace(0, 1, sample_steps, device=device)
+        if num_classes > 1:
+            repeats = (num_samples + num_classes - 1) // num_classes
+            class_list = torch.arange(num_classes, device=device).repeat(repeats)[:num_samples]
+        else:
+            class_list = torch.zeros(num_samples, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            x_init = torch.randn((num_samples, *input_shape), dtype=torch.float32, device=device)
+            solver = ODESolver(WrappedModel(flow))
+            final_samples = solver.sample(
+                x_init=x_init,
+                step_size=0.05,
+                method="midpoint",
+                time_grid=time_steps,
+                return_intermediates=False,
+                y=class_list,
+            )
+        final_samples = final_samples.detach().cpu()
+        save_path = output_dir / f"samples_epoch_{epoch_num:04d}.png"
+        save_image(final_samples, save_path, nrow=5, normalize=True)
+        print(f"Saved sample grid: {save_path}")
+
     for epoch in range(args.n_epochs):
         flow.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1:2d}/{args.n_epochs}")
@@ -125,6 +158,9 @@ def train(args: ScriptArguments):
             scaler.update()
 
             pbar.set_postfix({"loss": loss.item()})
+
+        if (epoch + 1) % 5 == 0:
+            save_sample_grid(epoch + 1)
 
     torch.save(flow.state_dict(), output_dir / "ckpt.pth")
     print(f"Final checkpoint saved to {output_dir / 'ckpt.pth'}")

@@ -1,3 +1,4 @@
+import random
 from collections.abc import Callable
 from pathlib import Path
 
@@ -9,10 +10,16 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms.v2 import Compose, Normalize, RandomHorizontalFlip, Resize, ToDtype, ToImage
 
 
-class TiffFolderDataset(Dataset):
-    """Single-class dataset that loads only .tiff files from a folder."""
+class TiffRandomCropDataset(Dataset):
+    """Single-class dataset that yields random 500x500 crops from .tiff files."""
 
-    def __init__(self, root: Path, transform: Callable | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        transform: Callable | None = None,
+        crop_size: int = 500,
+        synthetic_length: int = 10_000,
+    ) -> None:
         self.root = Path(root)
         if not self.root.is_dir():
             raise FileNotFoundError(f"boom_clay dataset directory not found: {self.root}")
@@ -24,18 +31,30 @@ class TiffFolderDataset(Dataset):
             raise ValueError(f"No .tiff files found in boom_clay directory: {self.root}")
 
         self.transform = transform
+        self.crop_size = crop_size
+        self.synthetic_length = synthetic_length
+
         self.classes = ["boom_clay"]
         self.class_to_idx = {self.classes[0]: 0}
-        self.targets = [0 for _ in self.samples]
+        self.targets = [0 for _ in range(self.synthetic_length)]
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return self.synthetic_length
 
     def __getitem__(self, index: int):
-        path = self.samples[index]
+        # Ignore index; pick a random file each time to amplify dataset size.
+        path = random.choice(self.samples)
         with Image.open(path) as img:
-            # Force RGB to keep channel count consistent for the model.
             img = img.convert("RGB")
+            width, height = img.size
+            if width < self.crop_size or height < self.crop_size:
+                raise ValueError(
+                    f"Image {path} is smaller than the requested crop size "
+                    f"{self.crop_size}x{self.crop_size} (got {width}x{height})"
+                )
+            x0 = random.randint(0, width - self.crop_size)
+            y0 = random.randint(0, height - self.crop_size)
+            img = img.crop((x0, y0, x0 + self.crop_size, y0 + self.crop_size))
 
         if self.transform is not None:
             img = self.transform(img)
@@ -48,6 +67,8 @@ def get_image_dataset(
     root: str | Path | None = None,
     train: bool = True,
     transform: Callable | None = None,
+    synthetic_length: int | None = None,
+    crop_size: int = 500,
 ) -> Dataset:
     default_root = Path(__file__).parents[2] / "data"
     root_path = Path(root) if root is not None else default_root
@@ -62,7 +83,10 @@ def get_image_dataset(
         return CelebA(root_path, train, transform, download=True)  # gdown is required to download
     elif dataset_name == "boom_clay":
         boom_root = Path(root) if root is not None else Path("/home/ucl/elen/aaouf/lemmens_slices/")
-        return TiffFolderDataset(boom_root, transform=transform)
+        synthetic_len = synthetic_length if synthetic_length is not None else 10_000
+        return TiffRandomCropDataset(
+            boom_root, transform=transform, crop_size=crop_size, synthetic_length=synthetic_len
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
