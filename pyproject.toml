@@ -1,0 +1,80 @@
+[project]
+name = "flow-matching"
+version = "0.0.1"
+description = "A Simple Implementation of Flow Matching in PyTorch"
+authors = [
+    { name = "Keishi Ishihara", email = "keishi.ishihara17@gmail.com" },
+]
+license = { text = "CC BY-NC-SA 4.0" }
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Private :: Do Not Upload",
+]
+dependencies = [
+    "einops==0.8.0",
+    "gdown>=5.2.0",
+    "matplotlib>=3.9.2",
+    "scikit-learn>=1.6.0",
+    "scipy==1.14.1",
+    "torch==2.4.1",
+    "torchdiffeq>=0.2.5",
+    "torchvision",
+    "tqdm==4.66.5",
+    "transformers>=4.48.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flow_matching*"]
+
+[tool.ruff]
+exclude = [".git", ".mypy_cache", ".ruff_cache", ".venv", "third_party"]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+fixable = ["ALL"]
+unfixable = []
+select = [
+    "A",  # flake8-builtin
+    "B",  # flake8-bugbear
+    "E",  # pycodestyle error
+    "F",  # Pyflakes
+    "I",  # isort
+    "N",  # pep8-naming
+    "W",  # pycodestyle warning
+    "PL",  # Pylint
+    "UP",  # pyupgrade
+]
+ignore = [
+    "B905",  # Zip-without-explicit-strict
+    "E501",  # Line too long
+    "F403",  # Unable to detect undefined names
+    "N812",  # Lowercase imported as non-lowercase
+    "N999",  # Invalid module name
+    "PLR0912",  # Too many branches
+    "PLR0913",  # Too many arguments in function definition
+    "PLR2004",  # Magic value used in comparison
+    "PLR0915",  # Too many statements
+    "PLR0402",  # Manual from import
+    "PLW2901",  # Redefined loop name
+]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.5",
+    "pytest>=8.3.4",
+    "ruff",
+]
