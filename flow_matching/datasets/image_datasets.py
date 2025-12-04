@@ -5,7 +5,8 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision.datasets import CIFAR10, MNIST, CelebA, FashionMNIST
-from torchvision.transforms.v2 import Compose, Normalize, RandomHorizontalFlip, ToDtype, ToImage
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.v2 import Compose, Normalize, RandomHorizontalFlip, Resize, ToDtype, ToImage
 
 
 class TiffFolderDataset(Dataset):
@@ -66,11 +67,22 @@ def get_image_dataset(
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
-def get_train_transform(horizontal_flip: bool = False, normalize: bool = True) -> Callable:
-    transform_list = [
-        ToImage(),  # convert to torchvision.tv_tensors.Image
-        ToDtype(torch.float32, scale=True),  # scale to [0, 1]
-    ]
+def get_train_transform(
+    horizontal_flip: bool = False,
+    normalize: bool = True,
+    image_size: int | None = None,
+) -> Callable:
+    transform_list = []
+    if image_size is not None:
+        transform_list.append(
+            Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC, antialias=True)
+        )
+    transform_list.extend(
+        [
+            ToImage(),  # convert to torchvision.tv_tensors.Image
+            ToDtype(torch.float32, scale=True),  # scale to [0, 1]
+        ]
+    )
     if horizontal_flip:
         transform_list.append(RandomHorizontalFlip())
     if normalize:
@@ -78,11 +90,18 @@ def get_train_transform(horizontal_flip: bool = False, normalize: bool = True) -
     return Compose(transform_list)
 
 
-def get_test_transform(normalize: bool = True) -> Callable:
-    transform_list = [
-        ToImage(),  # convert to torchvision.tv_tensors.Image
-        ToDtype(torch.float32, scale=True),  # scale to [0, 1]
-    ]
+def get_test_transform(normalize: bool = True, image_size: int | None = None) -> Callable:
+    transform_list = []
+    if image_size is not None:
+        transform_list.append(
+            Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC, antialias=True)
+        )
+    transform_list.extend(
+        [
+            ToImage(),  # convert to torchvision.tv_tensors.Image
+            ToDtype(torch.float32, scale=True),  # scale to [0, 1]
+        ]
+    )
     if normalize:
         transform_list.append(Normalize((0.5,), (0.5,)))  # normalize to [-1, 1]
     return Compose(transform_list)

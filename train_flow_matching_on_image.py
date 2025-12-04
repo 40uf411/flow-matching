@@ -26,6 +26,21 @@ from flow_matching.utils import model_size_summary, set_seed
 tqdm = partial(std_tqdm, dynamic_ncols=True)
 
 
+def resolve_image_size(dataset: str, override: int | None = None) -> int | None:
+    """Return the target square image size compatible with UNet."""
+    if override is not None:
+        return override
+
+    default_sizes = {
+        "mnist": 28,
+        "fashion_mnist": 28,
+        "cifar10": 32,
+        "celeba": 64,
+        "boom_clay": 256,
+    }
+    return default_sizes.get(dataset)
+
+
 @dataclass
 class ScriptArguments:
     do_train: bool = True
@@ -38,6 +53,7 @@ class ScriptArguments:
     seed: int = 42
     output_dir: str = "outputs"
     horizontal_flip: bool = False
+    image_size: int | None = None
 
 
 def train(args: ScriptArguments):
@@ -50,11 +66,15 @@ def train(args: ScriptArguments):
     set_seed(args.seed)
     print(f"Using device: {device}")
 
+    target_image_size = resolve_image_size(args.dataset, args.image_size)
+
     # Load the dataset
     dataset = get_image_dataset(
         args.dataset,
         train=True,
-        transform=get_train_transform(horizontal_flip=args.horizontal_flip),
+        transform=get_train_transform(
+            horizontal_flip=args.horizontal_flip, image_size=target_image_size
+        ),
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     print(f"Loaded {args.dataset} dataset with {len(dataset):,} samples")
@@ -120,11 +140,13 @@ def generate_samples_and_save_animation(args: ScriptArguments):
     set_seed(args.seed)
     print(f"Using device: {device}")
 
+    target_image_size = resolve_image_size(args.dataset, args.image_size)
+
     # Load the dataset
     dataset = get_image_dataset(
         args.dataset,
         train=False,
-        transform=get_test_transform(),
+        transform=get_test_transform(image_size=target_image_size),
     )
     input_shape = dataset[0][0].size()
     num_classes = len(dataset.classes)
