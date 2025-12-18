@@ -74,8 +74,8 @@ class Upsample(nn.Module):
 
     :param channels: channels in the inputs and outputs.
     :param use_conv: a bool determining if a convolution is applied.
-    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then upsampling occurs in the
-        inner-two dimensions.
+    :param dims: determines if the signal is 1D, 2D, or 3D. For 3D inputs all spatial dimensions
+        are upsampled.
     """
 
     def __init__(self, channels, use_conv, dims=2, out_channels=None):
@@ -89,10 +89,7 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         assert x.shape[1] == self.channels
-        if self.dims == 3:
-            x = F.interpolate(x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest")
-        else:
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
         if self.use_conv:
             x = self.conv(x)
         return x
@@ -103,8 +100,8 @@ class Downsample(nn.Module):
 
     :param channels: channels in the inputs and outputs.
     :param use_conv: a bool determining if a convolution is applied.
-    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then downsampling occurs in the
-        inner-two dimensions.
+    :param dims: determines if the signal is 1D, 2D, or 3D. For 3D inputs all spatial dimensions
+        are downsampled.
     """
 
     def __init__(self, channels, use_conv, dims=2, out_channels=None):
@@ -113,7 +110,7 @@ class Downsample(nn.Module):
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
         self.dims = dims
-        stride = 2 if dims != 3 else (1, 2, 2)
+        stride = 2 if dims != 3 else (2, 2, 2)
         if use_conv:
             self.op = conv_nd(dims, self.channels, self.out_channels, 3, stride=stride, padding=1)
         else:
@@ -869,9 +866,19 @@ class UNetModelWrapper(UNetModel):
         resblock_updown=False,
         use_fp16=False,
         use_new_attention_order=False,
+        dims=None,
     ):
-        """Dim (tuple): (C, H, W)"""
-        image_size = dim[-1]
+        """Dim (tuple): (C, H, W) for 2D or (C, D, H, W) for 3D volumes."""
+        spatial_shape = dim[1:]
+        inferred_dims = len(spatial_shape)
+        if dims is None:
+            dims = inferred_dims
+        if dims not in (2, 3):
+            raise ValueError(f"Unsupported dims={dims}; expected 2 or 3")
+        if inferred_dims != dims:
+            raise ValueError(f"Inferred {inferred_dims}D input from dim={dim}, but dims={dims} was provided")
+
+        image_size = spatial_shape[-1]
         if channel_mult is None:
             if image_size == 512:
                 channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
@@ -912,6 +919,7 @@ class UNetModelWrapper(UNetModel):
             use_scale_shift_norm=use_scale_shift_norm,
             resblock_updown=resblock_updown,
             use_new_attention_order=use_new_attention_order,
+            dims=dims,
         )
 
     def forward(self, t, x, y=None, *args, **kwargs):
