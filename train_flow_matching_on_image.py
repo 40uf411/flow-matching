@@ -1,3 +1,29 @@
+import os, tempfile
+custom_temp_dir = os.path.abspath("./temp")
+comet_cache_dir = os.path.abspath("./.comet-cache")
+comet_offline_dir = os.path.abspath("./.comet-offline")
+for directory in [custom_temp_dir, comet_cache_dir, comet_offline_dir]:
+    if not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+tempfile.tempdir = custom_temp_dir
+os.environ["TMPDIR"] = custom_temp_dir
+os.environ["TEMP"] = custom_temp_dir
+os.environ["TMP"] = custom_temp_dir
+os.environ["COMET_API_KEY"] = "lSTeuxfDnMITPnT8IFHY2fyWt"
+os.environ["COMET_PROJECT"] = "2d3d-1disc"
+os.environ["COMET_WORKSPACE"] = "40uf411"
+os.environ["COMET_CACHE_DIR"] = comet_cache_dir
+os.environ["COMET_OFFLINE_DIRECTORY"] = comet_offline_dir
+try:
+    import comet_ml
+    print(f"Using Comet.ml temp dir: {custom_temp_dir}")
+    print(f"Using Comet.ml cache dir: {comet_cache_dir}")
+    print(f"Using Comet.ml offline dir: {comet_offline_dir}")
+except ImportError:
+    print("Comet ML not installed. Please install with: pip install comet_ml")
+    raise
+from comet_ml.integration.pytorch import watch
+
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -54,10 +80,16 @@ class ScriptArguments:
     output_dir: str = "outputs"
     horizontal_flip: bool = False
     image_size: int | None = None
+    exp: str = "flow_matching_experiment"
 
 
 def train(args: ScriptArguments):
     """Train the flow matching model on the given dataset."""
+
+    experiment = comet_ml.Experiment(project_name=os.environ.get("COMET_PROJECT"),
+                                     workspace=os.environ.get("COMET_WORKSPACE"))
+    experiment.log_parameters(vars(args))
+    experiment.set_name(args.exp)
 
     output_dir = Path(args.output_dir) / "cfm" / args.dataset
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -82,6 +114,13 @@ def train(args: ScriptArguments):
     num_classes = len(dataset.classes)
     input_shape = dataset[0][0].size()
     print(f"{input_shape=}, {num_classes=}")
+
+    # let's make a grid of real images using torchvision.utils.make_grid and save it
+    real_images = torch.stack([dataset[i][0] for i in range(25)], dim=0)
+    grid = make_grid(real_images, nrow=5, normalize=True)
+    save_image(grid, output_dir / "real_images.png")
+    print(f"Saved real images grid to {output_dir / 'real_images.png'}")
+    experiment.log_image(output_dir / "real_images.png", name=f"real_preview_{args.exp}")
 
     # Load the UNet model with class conditioning for flow matching
     flow = UNetModel(
@@ -131,6 +170,32 @@ def train(args: ScriptArguments):
         save_path = output_dir / f"samples_epoch_{epoch_num:04d}.png"
         save_image(final_samples, save_path, nrow=5, normalize=True)
         print(f"Saved sample grid: {save_path}")
+        experiment.log_image(save_path, name=f"samples_epoch_{epoch_num:04d}_{args.exp}")
+
+    def log_comet_gradients(experiment, models: dict, step: int):
+        import math, torch.nn as nn
+        def get_model_grad_stats(model: nn.Module):
+            total_sq = 0.0
+            per_layer = {}
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                gn = g.norm(2).item()
+                total_sq += gn * gn
+                parts = name.split('.')
+                key = '.'.join(parts[:-1]) if len(parts) > 1 else parts[0]
+                per_layer.setdefault(key, []).append(gn)
+            global_l2 = math.sqrt(total_sq)
+            layer_norms = {k: sum(v) / max(1, len(v)) for k, v in per_layer.items()}
+            return global_l2, layer_norms
+        if experiment:
+            for name, model in models.items():
+                g_l2, layer = get_model_grad_stats(model)
+                experiment.log_metric(f"{name}_grad_l2_step", g_l2, step=step)
+                for layer_name, norm in list(layer.items())[:16]:
+                    experiment.log_metric(f"{name}/{layer_name}_grad_mean_step", norm, step=step)
+
 
     for epoch in range(args.n_epochs):
         flow.train()
@@ -150,7 +215,8 @@ def train(args: ScriptArguments):
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 vf_t = flow(t=t, x=x_t, y=y)
                 loss = F.mse_loss(vf_t, dx_t)
-
+            experiment.log_metric("train_loss", loss.item())
+            log_comet_gradients(experiment, {"flow": flow}, step=epoch * len(dataloader) + pbar.n)
             # Gradient scaling and backprop
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=1.0)  # clip gradients
@@ -164,6 +230,7 @@ def train(args: ScriptArguments):
 
     torch.save(flow.state_dict(), output_dir / "ckpt.pth")
     print(f"Final checkpoint saved to {output_dir / 'ckpt.pth'}")
+    
 
 
 def generate_samples_and_save_animation(args: ScriptArguments):
