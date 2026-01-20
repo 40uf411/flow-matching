@@ -262,10 +262,14 @@ def train(args: ScriptArguments):
                 cfg=EvalConfig(seed=epoch+1),
                 save_json_path=str(output_dir / f"eval_epoch_{epoch+1:04d}.json"),
             )
-            # optionally log key scalars to Comet
             experiment.log_metric("eval/patch_swd", metrics.get("divergence", {}).get("patch_swd", float("nan")), step=epoch+1)
             experiment.log_metric("eval/porosity_gen_mean", metrics["generated"]["porosity"]["mean"], step=epoch+1)
             experiment.log_metric("eval/porosity_real_mean", metrics["real"]["porosity"]["mean"], step=epoch+1)
+            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_tpcf.png", name=f"tpcf_epoch_{epoch+1:04d}_{args.exp}")
+            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_psd.png", name=f"psd_epoch_{epoch+1:04d}_{args.exp}")
+            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_pore_size.png", name=f"pore_size_epoch_{epoch+1:04d}_{args.exp}")
+            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_porosity.png", name=f"porosity_epoch_{epoch+1:04d}_{args.exp}")
+            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_cld.png", name=f"cld_epoch_{epoch+1:04d}_{args.exp}")
             ckpt_path = output_dir / f"ckpt_epoch_{epoch+1:04d}.pth"
             torch.save(
                 {
