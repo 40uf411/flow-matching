@@ -26,7 +26,7 @@ class TiffRandomCropDataset(Dataset):
             raise ValueError(f"No PNG/JPG crop files found in {self.root}")
 
         self.transform = transform
-        self.classes = ["illite_mp"]
+        self.classes = ["savonnieres_bin"]
         self.targets = [0] * len(self.samples)
 
     def __len__(self):
@@ -58,8 +58,8 @@ def get_image_dataset(
         return CIFAR10(root_path, train, transform, download=True)
     elif dataset_name == "celeba":
         return CelebA(root_path, train, transform, download=True)  # gdown is required to download
-    elif dataset_name == "illite_mp":
-        crops_root = Path(root) if root else Path("/export/home/aaouf/workspace/2d_images/illite_3P_2D_dataset")
+    elif dataset_name == "savonnieres_bin":
+        crops_root = Path(root) if root else Path("/export/home/aaouf/workspace/2d_images/savonnieres_2D_dataset")
         return TiffRandomCropDataset(crops_root, transform=transform)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -105,7 +105,7 @@ def get_test_transform(normalize: bool = True, image_size: int | None = None) ->
     return Compose(transform_list)
 
 
-def save_illite_mp_real_grid(
+def save_savonnieres_bin_real_grid(
     output_path: str | Path,
     root: str | Path | None = None,
     grid_size: int = 25,
@@ -113,11 +113,11 @@ def save_illite_mp_real_grid(
     crop_size: int = 500,
 ) -> Path:
     """
-    Save a grid of real illite_mp crops for visual comparison.
+    Save a grid of real savonnieres_bin crops for visual comparison.
 
     Args:
         output_path: Where to save the PNG.
-        root: Optional dataset root overriding the default illite_mp path.
+        root: Optional dataset root overriding the default savonnieres_bin path.
         grid_size: Grid dimension (grid_size x grid_size images).
         image_size: Optional resize (matches model input if provided).
         crop_size: Random crop size before any resize.
@@ -125,7 +125,7 @@ def save_illite_mp_real_grid(
 
     n_samples = grid_size * grid_size
     dataset = get_image_dataset(
-        "illite_mp",
+        "savonnieres_bin",
         root=root,
         train=True,
         transform=get_test_transform(image_size=image_size),
@@ -148,12 +148,12 @@ def save_illite_mp_real_grid(
 
 if __name__ == "__main__":
     # Convenience entrypoint to dump a real-image grid for comparison with generated samples.
-    default_output = Path(__file__).parents[2] / "outputs" / "cfm" / "illite_mp" / "real_grid.png"
-    saved_path = save_illite_mp_real_grid(
+    default_output = Path(__file__).parents[2] / "outputs" / "cfm" / "savonnieres_bin" / "real_grid.png"
+    saved_path = save_savonnieres_bin_real_grid(
         output_path=default_output,
         root=None,
         grid_size=25,
-        image_size=256,  # match the default illite_mp training size
+        image_size=256,  # match the default savonnieres_bin training size
         crop_size=500,
     )
-    print(f"Saved illite_mp real grid to {saved_path}")
+    print(f"Saved savonnieres_bin real grid to {saved_path}")
