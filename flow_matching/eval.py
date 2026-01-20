@@ -152,8 +152,22 @@ def eval(
     out_dir = save_json_path.parent 
     ensure_dir(out_dir)
 
-    gen = to_numpy(generated.squeeze(1))
-    real = to_numpy(real.squeeze(1))
+    def to_scalar_field(x: torch.Tensor) -> np.ndarray:
+        """
+        Convert [B, C, H, W] or [B, H, W] tensor to [B, H, W]
+        by averaging channels if needed.
+        """
+        x = x.detach().cpu()
+        if x.ndim == 4:
+            return x.mean(dim=1).numpy()
+        elif x.ndim == 3:
+            return x.numpy()
+        else:
+            raise ValueError(f"Unsupported tensor shape {tuple(x.shape)}")
+
+    gen = to_scalar_field(generated)
+    real = to_scalar_field(real)
+
 
     gen_bin = binarize(gen, cfg.threshold)
     real_bin = binarize(real, cfg.threshold)
