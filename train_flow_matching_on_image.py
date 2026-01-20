@@ -83,7 +83,7 @@ class ScriptArguments:
     do_sample: bool = True
     dataset: str = "savonnieres_bin"
     batch_size: int = 32
-    n_epochs: int = 300
+    n_epochs: int = 150
     learning_rate: float = 1e-4  # lowered from 1e-3 to reduce early overfitting risk
     sigma_min: float = 0.0
     seed: int = 42
@@ -253,7 +253,7 @@ def train(args: ScriptArguments):
             pbar.set_postfix({"loss": float(loss.item())})
             global_step += 1
 
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 50 == 0:
             final_samples = save_sample_grid(epoch + 1)
             real_batch, _ = next(iter(DataLoader(dataset, batch_size=final_samples.size(0), shuffle=True, drop_last=True)))
             metrics = run_eval(
