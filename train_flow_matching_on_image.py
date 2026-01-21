@@ -72,7 +72,7 @@ def resolve_image_size(dataset: str, override: int | None = None) -> int | None:
         "fashion_mnist": 28,
         "cifar10": 32,
         "celeba": 64,
-        "savonnieres_bin": 256,
+        "bentheimer_bin": 256,
     }
     return default_sizes.get(dataset)
 
@@ -81,7 +81,7 @@ def resolve_image_size(dataset: str, override: int | None = None) -> int | None:
 class ScriptArguments:
     do_train: bool = True
     do_sample: bool = True
-    dataset: str = "savonnieres_bin"
+    dataset: str = "bentheimer_bin"
     batch_size: int = 32
     n_epochs: int = 150
     learning_rate: float = 1e-4  # lowered from 1e-3 to reduce early overfitting risk
@@ -90,7 +90,7 @@ class ScriptArguments:
     output_dir: str = "outputs"
     horizontal_flip: bool = False
     image_size: int | None = None
-    exp: str = "fm_exp_savonnieres_bin"
+    exp: str = "fm_exp_bentheimer_bin"
 
     # Logging controls
     grad_log_every: int = 100  # log gradient stats every N steps (0 disables)
