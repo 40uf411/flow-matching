@@ -27,6 +27,22 @@ class EvalConfig:
 # Utilities
 # =========================
 
+def volume_to_2d(x):
+    """
+    Convert a batch of 3D scalar fields to 2D by taking the mid-slice.
+    Accepts numpy arrays:
+      (B,D,H,W) -> (B,H,W)
+      (D,H,W)   -> (H,W)
+    """
+    if x.ndim == 4:
+        B, D, H, W = x.shape
+        return x[:, D // 2, :, :]
+    if x.ndim == 3:
+        D, H, W = x.shape
+        return x[D // 2, :, :]
+    return x
+
+
 def to_numpy(x: torch.Tensor) -> np.ndarray:
     return x.detach().cpu().numpy()
 
@@ -35,7 +51,20 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def binarize(imgs: np.ndarray, thr: float) -> np.ndarray:
+def binarize(imgs, thr):
+    """
+    imgs: np.ndarray or torch.Tensor
+    returns: same type (np.uint8 or torch.uint8)
+    """
+    if isinstance(imgs, torch.Tensor):
+        if thr is None:
+            # default threshold at 0 for [-1,1] normalized tensors (common in diffusion/FM)
+            thr = 0.0
+        return (imgs > thr).to(torch.uint8)
+
+    # numpy path
+    if thr is None:
+        thr = 0
     return (imgs > thr).astype(np.uint8)
 
 
@@ -62,9 +91,32 @@ def patch_swd(real, gen, patch_size, max_patches):
     swd = np.mean([wasserstein_distance(r[:, i], g[:, i]) for i in range(r.shape[1])])
     return float(swd)
 
-
 def porosity(binary):
-    return 1.0 - binary.mean(axis=(1, 2))
+    if isinstance(binary, torch.Tensor):
+        x = binary
+        if x.dim() == 2:        # (H,W)
+            x = x.unsqueeze(0)
+        elif x.dim() == 3:      # (D,H,W) OR (B,H,W)
+            # Ambiguous; assume batch if first dim is batch-like? We'll treat as (B,H,W) if C absent.
+            # In our pipeline we pass (B,D,H,W), so this is mainly for safety.
+            pass
+        elif x.dim() == 4:      # (B,D,H,W)
+            pass
+        else:
+            raise ValueError(f"Unsupported tensor shape for porosity: {tuple(x.shape)}")
+
+        x = x.to(torch.float32)
+        # mean over all spatial dims (everything except batch dim 0)
+        dims = tuple(range(1, x.dim()))
+        return 1.0 - x.mean(dim=dims)
+
+    # numpy path
+    x = binary
+    if x.ndim == 2:
+        x = x[None, ...]
+    x = x.astype(np.float32, copy=False)
+    dims = tuple(range(1, x.ndim))
+    return 1.0 - x.mean(axis=dims)
 
 
 def two_point_corr(binary, max_r=64):
@@ -152,18 +204,24 @@ def eval(
     out_dir = save_json_path.parent 
     ensure_dir(out_dir)
 
-    def to_scalar_field(x: torch.Tensor) -> np.ndarray:
-        """
-        Convert [B, C, H, W] or [B, H, W] tensor to [B, H, W]
-        by averaging channels if needed.
-        """
-        x = x.detach().cpu()
-        if x.ndim == 4:
-            return x.mean(dim=1).numpy()
-        elif x.ndim == 3:
-            return x.numpy()
-        else:
-            raise ValueError(f"Unsupported tensor shape {tuple(x.shape)}")
+    def to_scalar_field(x: torch.Tensor) -> torch.Tensor:
+        # Accept:
+        #  (B,H,W)
+        #  (B,1,H,W) -> (B,H,W)
+        #  (B,D,H,W)
+        #  (B,1,D,H,W) -> (B,D,H,W)
+        if x.dim() == 3:
+            return x
+        if x.dim() == 4:
+            if x.size(1) == 1:
+                return x[:, 0]
+            return x  # (B,H,W) assumed already
+        if x.dim() == 5:
+            if x.size(1) == 1:
+                return x[:, 0]  # (B,D,H,W)
+            raise ValueError(f"Expected C==1 for 3D volumes, got shape {tuple(x.shape)}")
+        raise ValueError(f"Unsupported tensor shape {tuple(x.shape)}")
+
 
     gen = to_scalar_field(generated)
     real = to_scalar_field(real)
@@ -172,10 +230,13 @@ def eval(
     gen_bin = binarize(gen, cfg.threshold)
     real_bin = binarize(real, cfg.threshold)
 
+    real_2d = volume_to_2d(real_bin if real_bin.ndim in (3,4) else real)
+    gen_2d  = volume_to_2d(gen_bin  if gen_bin.ndim  in (3,4) else gen)
+    
     # ---- Metrics
     metrics = {
         "divergence": {
-            "patch_swd": patch_swd(real, gen, cfg.patch_size, cfg.max_patches),
+            "patch_swd": patch_swd(real_2d, gen_2d, cfg.patch_size, cfg.max_patches),
         },
         "generated": {},
         "real": {},

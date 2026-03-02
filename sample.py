@@ -9,7 +9,7 @@ from flow_matching.solver import ODESolver, ModelWrapper
 # =========================
 # USER SETTINGS
 # =========================
-CKPT_PATH = "outputs/cfm/banderabrown_bin/ckpt_epoch_0150.pth"  # or ckpt.pth
+CKPT_PATH = "outputs/cfm/illite_mp/ckpt_epoch_0150.pth"  # or ckpt.pth
 OUTPUT_DIR = "sample_outputs"
 N_SAMPLES = 256
 H = 256

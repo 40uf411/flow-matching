@@ -82,22 +82,17 @@ def get_image_dataset(
     train: bool = True,
     transform: Callable | None = None,
     synthetic_length: int | None = None,
-    crop_size: int = 500,  # kept only for signature compatibility; unused
+    crop_size: int = 500,
 ) -> Dataset:
-    """
-    3D dataset loader. Keeps same name/signature as 2D version.
-
-    `dataset_name` can be anything you choose; simplest is to use one name like "volume".
-    """
     if root is None:
         raise ValueError("For 3D datasets, `root` must point to the folder of .npy volumes.")
 
     root_path = Path(root)
+    if not root_path.is_dir():
+        raise FileNotFoundError(f"3D dataset folder not found: {root_path}")
 
-    if dataset_name in ("volume", "volumes", "banderabrown_bin_3d"):
-        return NpyVolumeDataset(root_path, transform=transform)
-
-    raise ValueError(f"Unknown 3D dataset: {dataset_name}")
+    # IMPORTANT: no dataset_name switch/case here
+    return NpyVolumeDataset(root_path, transform=transform)
 
 
 def get_train_transform(

@@ -23,7 +23,7 @@ from flow_matching.sampler import PathSampler
 from flow_matching.solver import ModelWrapper, ODESolver
 from flow_matching.utils import model_size_summary, set_seed
 
-from flow_matching.eval import eval as run_eval, EvalConfig
+from flow_matching.eval_3D import eval as run_eval, EvalConfig
 
 # =========================
 # Temp dirs / Comet dirs
@@ -112,9 +112,10 @@ class ScriptArguments:
     do_train: bool = True
     do_sample: bool = True
     dataset: str = "banderabrown_bin"
+    data_root: str = "datasets_3d"          # <-- ADD (parent folder containing dataset subfolders)
     batch_size: int = 32
     n_epochs: int = 150
-    learning_rate: float = 1e-4  # lowered from 1e-3 to reduce early overfitting risk
+    learning_rate: float = 1e-4
     sigma_min: float = 0.0
     seed: int = 42
     output_dir: str = "outputs"
@@ -122,8 +123,61 @@ class ScriptArguments:
     image_size: int | None = None
     exp: str = "fm_exp_banderabrown_bin"
 
-    # Logging controls
-    grad_log_every: int = 100  # log gradient stats every N steps (0 disables)
+    # NEW: resume + debug cadence
+    resume: bool = True                   # <-- ADD
+    eval_every: int = 1                    # <-- ADD (set 1 while debugging)
+    save_every: int = 1                    # <-- ADD (set 1 while debugging)
+
+    grad_log_every: int = 0   # ✅ ADD THIS
+
+def _find_resume_checkpoint(output_dir: Path) -> Path | None:
+    """
+    Prefer latest ckpt_epoch_XXXX.pth if present; otherwise fall back to ckpt.pth.
+    """
+    epoch_ckpts = sorted(output_dir.glob("ckpt_epoch_*.pth"))
+    if epoch_ckpts:
+        return epoch_ckpts[-1]
+    last = output_dir / "ckpt.pth"
+    if last.exists():
+        return last
+    return None
+
+
+def _load_checkpoint_maybe(
+    ckpt_path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    device: torch.device,
+) -> tuple[int, int]:
+    """
+    Loads either:
+      - full checkpoint dict with keys: model_state_dict, optimizer_state_dict, epoch, global_step
+      - OR a raw state_dict (OrderedDict)
+    Returns: (start_epoch, global_step)
+    """
+    obj = torch.load(ckpt_path, map_location=device)
+
+    start_epoch = 0
+    global_step = 0
+
+    # Case A: full checkpoint
+    if isinstance(obj, dict) and ("model_state_dict" in obj or "state_dict" in obj):
+        sd = obj.get("model_state_dict", obj.get("state_dict"))
+        model.load_state_dict(sd, strict=True)
+
+        if optimizer is not None and "optimizer_state_dict" in obj:
+            try:
+                optimizer.load_state_dict(obj["optimizer_state_dict"])
+            except Exception as e:
+                print(f"WARNING: could not load optimizer state ({e}). Continuing with fresh optimizer.")
+
+        start_epoch = int(obj.get("epoch", 0))
+        global_step = int(obj.get("global_step", 0))
+        return start_epoch, global_step
+
+    # Case B: raw state_dict
+    model.load_state_dict(obj, strict=True)
+    return 0, 0
 
 
 def train(args: ScriptArguments):
@@ -146,8 +200,10 @@ def train(args: ScriptArguments):
     target_image_size = resolve_image_size(args.dataset, args.image_size)
 
     # Load dataset
+    dataset_root = Path(args.data_root) / args.dataset
     dataset = get_image_dataset(
         args.dataset,
+        root=dataset_root,
         train=True,
         transform=get_train_transform(horizontal_flip=args.horizontal_flip, image_size=target_image_size),
     )
@@ -253,9 +309,26 @@ def train(args: ScriptArguments):
         global_l2 = math.sqrt(total_sq)
         experiment.log_metric("flow_grad_l2_step", global_l2, step=step)
 
+    start_epoch = 0
     global_step = 0
 
-    for epoch in range(args.n_epochs):
+    if args.resume:
+        resume_path = _find_resume_checkpoint(output_dir)
+        if resume_path is None:
+            print("Resume requested, but no checkpoint found. Starting from scratch.")
+        else:
+            start_epoch, global_step = _load_checkpoint_maybe(
+                ckpt_path=resume_path,
+                model=flow,
+                optimizer=optimizer,
+                device=device,
+            )
+            # IMPORTANT: start_epoch returned is the last completed epoch number,
+            # so we continue from there (epoch index start_epoch)
+            print(f"Resumed from {resume_path} | start_epoch={start_epoch}, global_step={global_step}")
+
+
+    for epoch in range(start_epoch, args.n_epochs):
         flow.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1:3d}/{args.n_epochs}")
 
@@ -287,27 +360,15 @@ def train(args: ScriptArguments):
             pbar.set_postfix({"loss": float(loss.item())})
             global_step += 1
 
-        if (epoch + 1) % 50 == 0:
-            final_samples = save_sample_grid(epoch + 1)
-            real_batch, _ = next(iter(DataLoader(dataset, batch_size=final_samples.size(0), shuffle=True, drop_last=True)))
-            metrics = run_eval(
-                generated=final_samples,      # torch Tensor OK
-                real=real_batch,              # torch Tensor OK
-                cfg=EvalConfig(seed=epoch+1),
-                save_json_path=str(output_dir / f"eval_epoch_{epoch+1:04d}.json"),
-            )
-            experiment.log_metric("eval/patch_swd", metrics.get("divergence", {}).get("patch_swd", float("nan")), step=epoch+1)
-            experiment.log_metric("eval/porosity_gen_mean", metrics["generated"]["porosity"]["mean"], step=epoch+1)
-            experiment.log_metric("eval/porosity_real_mean", metrics["real"]["porosity"]["mean"], step=epoch+1)
-            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_tpcf.png", name=f"tpcf_epoch_{epoch+1:04d}_{args.exp}")
-            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_psd.png", name=f"psd_epoch_{epoch+1:04d}_{args.exp}")
-            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_pore_size.png", name=f"pore_size_epoch_{epoch+1:04d}_{args.exp}")
-            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_porosity.png", name=f"porosity_epoch_{epoch+1:04d}_{args.exp}")
-            experiment.log_image(output_dir / f"epoch_{epoch+1:04d}_cld.png", name=f"cld_epoch_{epoch+1:04d}_{args.exp}")
-            ckpt_path = output_dir / f"ckpt_epoch_{epoch+1:04d}.pth"
+        # --- end of each epoch ---
+        epoch_num = epoch + 1
+
+        # 1) Save checkpoint (frequent during debugging)
+        if args.save_every > 0 and (epoch_num % args.save_every == 0):
+            ckpt_path = output_dir / f"ckpt_epoch_{epoch_num:04d}.pth"
             torch.save(
                 {
-                    "epoch": epoch + 1,
+                    "epoch": epoch_num,
                     "global_step": global_step,
                     "model_state_dict": flow.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -318,15 +379,44 @@ def train(args: ScriptArguments):
                 },
                 ckpt_path,
             )
-            print(f"Checkpoint saved to {ckpt_path}")
+            # Also keep a rolling pointer
+            torch.save(flow.state_dict(), output_dir / "ckpt.pth")
+            print(f"Checkpoint saved to {ckpt_path} (+ updated ckpt.pth)")
+
+        # 2) Eval cadence (frequent during debugging)
+        if args.eval_every > 0 and (epoch_num % args.eval_every == 0):
+            final_samples = save_sample_grid(epoch_num)
+
+            real_batch, _ = next(
+                iter(DataLoader(dataset, batch_size=final_samples.size(0), shuffle=True, drop_last=True))
+            )
+
+            metrics = run_eval(
+                generated=final_samples,  # torch Tensor
+                real=real_batch,          # torch Tensor
+                cfg=EvalConfig(seed=epoch_num),
+                save_json_path=str(output_dir / f"eval_epoch_{epoch_num:04d}.json"),
+            )
+
+            # log metrics/images (keep your existing logging lines)
+            experiment.log_metric("eval/patch_swd", metrics.get("divergence", {}).get("patch_swd", float("nan")), step=epoch_num)
+            experiment.log_metric("eval/porosity_gen_mean", metrics["generated"]["porosity"]["mean"], step=epoch_num)
+            experiment.log_metric("eval/porosity_real_mean", metrics["real"]["porosity"]["mean"], step=epoch_num)
+
+            # log plots if they exist
+            for name in ["tpcf", "psd", "pore_size", "porosity", "cld"]:
+                p = output_dir / f"epoch_{epoch_num:04d}_{name}.png"
+                if p.exists():
+                    experiment.log_image(p, name=f"{name}_epoch_{epoch_num:04d}_{args.exp}")
+
+
 
     torch.save(flow.state_dict(), output_dir / "ckpt.pth")
     print(f"Final checkpoint saved to {output_dir / 'ckpt.pth'}")
 
 
-def generate_samples_and_save_animation(args: ScriptArguments):
-    """Generate samples following the flow and save the animation."""
 
+def generate_samples_and_save_animation(args: ScriptArguments):
     output_dir = Path(args.output_dir) / "cfm" / args.dataset
     assert output_dir.is_dir(), f"Output directory {output_dir} does not exist"
 
@@ -334,16 +424,13 @@ def generate_samples_and_save_animation(args: ScriptArguments):
     set_seed(args.seed)
     print(f"Using device: {device}")
 
-    target_image_size = resolve_image_size(args.dataset, args.image_size)
-
-    dataset = get_image_dataset(
-        args.dataset,
-        train=False,
-        transform=get_test_transform(image_size=target_image_size),
-    )
-    input_shape = dataset[0][0].size()
-    num_classes = len(dataset.classes)
-    class_cond = (num_classes > 1)
+    # -------------------------
+    # HARD-CODED MODEL SETTINGS
+    # -------------------------
+    input_shape = (1, 64, 64, 64)
+    num_classes = 1
+    class_cond = False
+    class_list = None
 
     flow = UNetModel(
         input_shape,
@@ -352,72 +439,109 @@ def generate_samples_and_save_animation(args: ScriptArguments):
         num_classes=num_classes,
         class_cond=class_cond,
         dims=3,
-        attention_resolutions="999999"
+        attention_resolutions="999999",
     ).to(device)
 
-    # Robust load without relying on weights_only=True
     state_dict = torch.load(output_dir / "ckpt.pth", map_location=device)
-    flow.load_state_dict(state_dict)
+    flow.load_state_dict(state_dict, strict=True)
     flow.eval()
 
     class WrappedModel(ModelWrapper):
         def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:
             return self.model(x=x, t=t, **extras)
 
-    samples_per_class = 10
-    sample_steps = 101
-    time_steps = torch.linspace(0, 1, sample_steps, device=device)
-
-    if class_cond:
-        class_list = torch.arange(num_classes, device=device).repeat(samples_per_class)
-    else:
-        class_list = None
-        # if not class-conditional, just sample this many total
-        total = samples_per_class * max(1, num_classes)
-
     wrapped_model = WrappedModel(flow)
     solver = ODESolver(wrapped_model)
+
+    # -------------------------
+    # SAMPLING SETTINGS
+    # -------------------------
+    total_samples = 100          # how many 3D volumes you want in total
+    batch_samples = 20            # chunk size to avoid OOM (try 2/4/5/8)
+    sample_steps = 101
+    time_steps = torch.linspace(0, 1, sample_steps, device=device)
     step_size = 0.05
 
-    if class_cond:
-        x_init = torch.randn((class_list.size(0), *input_shape), dtype=torch.float32, device=device)
-    else:
-        x_init = torch.randn((total, *input_shape), dtype=torch.float32, device=device)
+    # For GIF only (keep small!)
+    make_gif = True
+    gif_samples = 10             # number of volumes in GIF (small)
+    gif_return_intermediates = True
 
-    sol = solver.sample(
-        x_init=x_init,
-        step_size=step_size,
-        method="midpoint",
-        time_grid=time_steps,
-        return_intermediates=True,
-        y=class_list,
-    )
-    sol = sol.detach().cpu()
-    final_samples = sol[-1]
+    # -------------------------
+    # 1) Generate ALL final samples in batches (NO intermediates)
+    # -------------------------
+    all_final = []
+    remaining = total_samples
 
-    # Save raw + norm
-    final_slices = volumes_to_slices(final_samples)
-    save_image(final_slices, output_dir / "final_samples_raw.png", nrow=(num_classes if class_cond else 10), normalize=False)
-    save_image(final_slices, output_dir / "final_samples_norm.png", nrow=(num_classes if class_cond else 10), normalize=True)
+    with torch.no_grad():
+        while remaining > 0:
+            b = min(batch_samples, remaining)
+            x_init = torch.randn((b, *input_shape), dtype=torch.float32, device=device)
 
-    fig, ax = plt.subplots(1, 2, figsize=(8, 4))
-    grid = make_grid(final_slices, nrow=(num_classes if class_cond else 10), normalize=True)
-    ax[0].imshow(grid.permute(1, 2, 0))
-    ax[0].set_title("Final samples (t = 1.0)", fontsize=16)
-    ax[0].axis("off")
+            # key: return_intermediates=False to save memory
+            final = solver.sample(
+                x_init=x_init,
+                step_size=step_size,
+                method="midpoint",
+                time_grid=time_steps,
+                return_intermediates=False,
+                y=class_list,
+            )
 
-    def update(frame: int):
-        frame_slices = volumes_to_slices(sol[frame])  # sol[frame]: (B,C,D,H,W) -> (B,C,H,W)
-        grid = make_grid(frame_slices, nrow=(num_classes if class_cond else 10), normalize=True)
-        ax[1].clear()
-        ax[1].imshow(grid.permute(1, 2, 0))
-        ax[1].set_title(f"t = {time_steps[frame].item():.2f}", fontsize=16)
-        ax[1].axis("off")
+            all_final.append(final.detach().cpu())
+            remaining -= b
+            print(f"Sampled {total_samples - remaining}/{total_samples}")
 
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.05, wspace=0.1)
-    ani = animation.FuncAnimation(fig, update, frames=sample_steps)
-    ani.save(output_dir / "trajectory.gif", writer="pillow", fps=20)
-    print(f"Generated trajectory saved to {output_dir / 'trajectory.gif'}")
+    final_samples = torch.cat(all_final, dim=0)  # (N,C,D,H,W)
+
+    # Save ALL volumes to npy
+    import numpy as np
+    npy_path = output_dir / "generated_samples.npy"
+    np.save(npy_path, final_samples.numpy())
+    print(f"Saved generated volumes to {npy_path} with shape {tuple(final_samples.shape)}")
+
+    # Save 2D grids of middle slices
+    final_slices = volumes_to_slices(final_samples)  # (N,C,H,W)
+    # choose a square-ish grid: for 100 => 10x10
+    nrow = int(round(total_samples ** 0.5))
+    save_image(final_slices, output_dir / "final_samples_raw.png", nrow=nrow, normalize=False)
+    save_image(final_slices, output_dir / "final_samples_norm.png", nrow=nrow, normalize=True)
+
+    # -------------------------
+    # 2) Optional GIF: do a SMALL run with intermediates
+    # -------------------------
+    if make_gif:
+        with torch.no_grad():
+            x_init_gif = torch.randn((gif_samples, *input_shape), dtype=torch.float32, device=device)
+            sol = solver.sample(
+                x_init=x_init_gif,
+                step_size=step_size,
+                method="midpoint",
+                time_grid=time_steps,
+                return_intermediates=gif_return_intermediates,  # True for GIF
+                y=None,
+            ).detach().cpu()  # (T,B,C,D,H,W)
+
+        # Build GIF from slices
+        fig, ax = plt.subplots(1, 2, figsize=(8, 4))
+        grid0 = make_grid(volumes_to_slices(sol[-1]), nrow=gif_samples, normalize=True)
+        ax[0].imshow(grid0.permute(1, 2, 0))
+        ax[0].set_title("Final samples (t=1.0)", fontsize=16)
+        ax[0].axis("off")
+
+        def update(frame: int):
+            frame_slices = volumes_to_slices(sol[frame])
+            grid = make_grid(frame_slices, nrow=gif_samples, normalize=True)
+            ax[1].clear()
+            ax[1].imshow(grid.permute(1, 2, 0))
+            ax[1].set_title(f"t = {time_steps[frame].item():.2f}", fontsize=16)
+            ax[1].axis("off")
+
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.05, wspace=0.1)
+        ani = animation.FuncAnimation(fig, update, frames=sample_steps)
+        ani.save(output_dir / "trajectory.gif", writer="pillow", fps=20)
+        print(f"Generated trajectory saved to {output_dir / 'trajectory.gif'}")
+
 
 
 if __name__ == "__main__":
