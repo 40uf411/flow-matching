@@ -30,6 +30,8 @@ from torchvision.transforms.v2 import (
     Resize,
     ToDtype,
     ToImage,
+    RandomCrop, 
+    CenterCrop
 )
 from torchvision.utils import save_image
 
@@ -63,18 +65,7 @@ def _pick_slice_ids(
     # Fallback: unique without spacing constraint
     return sorted(rng.sample(range(D), k))
 
-
 class Pseudo3DSlicesDataset(Dataset):
-    """
-    Builds a pseudo 3D volume by inserting K random 2D crops at random slice ids
-    for ONE chosen orientation per returned sample.
-
-    Returns:
-        Y: [C, D, H, W]
-        M: [1, D, H, W]
-        orient_id: int {0:xy, 1:xz, 2:yz}
-        (optional) debug dict if return_debug=True
-    """
 
     ORIENTS: tuple[Orientation, ...] = ("xy", "xz", "yz")
     ORIENT_TO_ID = {"xy": 0, "xz": 1, "yz": 2}
@@ -91,6 +82,8 @@ class Pseudo3DSlicesDataset(Dataset):
         seed: int = 0,
         per_orient_roots: dict[Orientation, Path] | None = None,
         file_suffixes: tuple[str, ...] = (".png", ".jpg", ".jpeg"),
+        synthetic_length: int | None = None,
+        probe_mode: Literal["random", "index"] = "random",
     ):
         self.root = Path(root)
         self.transform = transform
@@ -103,6 +96,7 @@ class Pseudo3DSlicesDataset(Dataset):
         self.min_gap = int(min_gap)
         self.choose_orientation = choose_orientation
         self.return_debug = return_debug
+        self.probe_mode = probe_mode
 
         self.rng = random.Random(seed)
         self._cycle_idx = 0
@@ -123,14 +117,19 @@ class Pseudo3DSlicesDataset(Dataset):
                 raise ValueError(f"No image files found in {r} (suffixes={file_suffixes}).")
             self.samples[o] = files
 
-        # Stable length: max count across orientations
-        self._length = max(len(v) for v in self.samples.values())
+        # Synthetic dataset length (online sample generation)
+        if synthetic_length is None:
+            self._length = max(len(v) for v in self.samples.values())
+        else:
+            self._length = int(synthetic_length)
+            if self._length <= 0:
+                raise ValueError("synthetic_length must be > 0.")
 
         # Optional single-class metadata
         self.classes = ["banderabrown_bin"]
         self.targets = [0] * self._length
 
-        # Basic sanity checks
+        # Sanity checks
         if self.transform is None:
             raise ValueError("transform must be provided and must return a torch.Tensor [C,H,W].")
         if self.D <= 0:
@@ -139,6 +138,8 @@ class Pseudo3DSlicesDataset(Dataset):
             raise ValueError("k_slices must be >= 0.")
         if self.choose_orientation not in ("random", "cycle"):
             raise ValueError("choose_orientation must be 'random' or 'cycle'.")
+        if self.probe_mode not in ("random", "index"):
+            raise ValueError("probe_mode must be 'random' or 'index'.")
 
     def __len__(self) -> int:
         return self._length
@@ -164,19 +165,18 @@ class Pseudo3DSlicesDataset(Dataset):
             )
         return x
 
+    def _pick_probe_path(self, o: Orientation, idx: int) -> Path:
+        if self.probe_mode == "index":
+            return self.samples[o][idx % len(self.samples[o])]
+        return self.samples[o][self.rng.randrange(len(self.samples[o]))]
+
     def __getitem__(self, idx: int):
         o = self._choose_orientation(idx)
         orient_id = self.ORIENT_TO_ID[o]
-
-        # Pick slice ids in [0..D-1] with optional spacing constraint
         slice_ids = _pick_slice_ids(self.D, self.k_slices, self.min_gap, self.rng)
-
-        # Determine channels C from one transformed image
-        probe_path = self.samples[o][idx % len(self.samples[o])]
+        probe_path = self._pick_probe_path(o, idx)
         probe = self._load_image(probe_path)
         C = probe.shape[0]
-
-        # Initialize pseudo volume + mask (zeros in unobserved voxels)
         Y = torch.zeros((C, self.D, self.H, self.W), dtype=probe.dtype)
         M = torch.zeros((1, self.D, self.H, self.W), dtype=probe.dtype)
 
@@ -184,16 +184,13 @@ class Pseudo3DSlicesDataset(Dataset):
         for s in slice_ids:
             p = self.samples[o][self.rng.randrange(len(self.samples[o]))]
             chosen_paths.append(p)
-            crop = self._load_image(p)  # [C,H,W]
-
-            # Canonical volume layout: [C, z, y, x] == [C, D, H, W]
+            crop = self._load_image(p)
             if o == "xy":
                 # xy plane at z=s
                 Y[:, s, :, :] = crop
                 M[:, s, :, :] = 1.0
             elif o == "xz":
                 # xz plane at y=s  => indices [z, x] stored at Y[:, z, s, x]
-                # Since crop is [C,H,W] and H==D, interpret crop[:, z, x].
                 Y[:, :, s, :] = crop
                 M[:, :, s, :] = 1.0
             else:  # "yz"
@@ -210,7 +207,6 @@ class Pseudo3DSlicesDataset(Dataset):
             return Y, M, orient_id, debug
 
         return Y, M, orient_id
-
 
 def get_image_dataset(
     dataset_name: str,
@@ -247,7 +243,7 @@ def get_image_dataset(
     if dataset_name == "celeba":
         return CelebA(root_path, train, transform, download=True)  # gdown may be required
 
-    if dataset_name in ("banderabrown_bin_p3d", "banderabrown_p3d"):
+    else:
         data_root = Path(root) if root else Path("/export/home/aaouf/workspace/2d_images/banderabrown_2D_dataset")
         # Use different seed for train vs test for deterministic-ish behavior if desired
         seed = 0 if train else 123
@@ -260,6 +256,7 @@ def get_image_dataset(
             choose_orientation=choose_orientation,
             return_debug=return_debug,
             seed=seed,
+            synthetic_length=5000,
         )
         if synthetic_length is not None:
             return _LengthWrapper(ds, int(synthetic_length))
@@ -289,9 +286,7 @@ def get_train_transform(
 ) -> Callable:
     transform_list = []
     if image_size is not None:
-        transform_list.append(
-            Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC, antialias=True)
-        )
+        transform_list.append(RandomCrop((image_size, image_size)))
     transform_list.extend(
         [
             ToImage(),
@@ -309,9 +304,7 @@ def get_train_transform(
 def get_test_transform(normalize: bool = True, image_size: int | None = None) -> Callable:
     transform_list = []
     if image_size is not None:
-        transform_list.append(
-            Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC, antialias=True)
-        )
+        transform_list.append(RandomCrop((image_size, image_size)))
     transform_list.extend(
         [
             ToImage(),

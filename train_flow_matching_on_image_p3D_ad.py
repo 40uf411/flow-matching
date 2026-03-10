@@ -1,3 +1,4 @@
+# Adversarial flow matching on pseudo-3D image datasets (e.g. banderabrown_bin_p3d).
 import os, tempfile
 from dataclasses import dataclass
 from functools import partial
@@ -6,7 +7,7 @@ from pathlib import Path
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
@@ -19,10 +20,15 @@ from flow_matching.datasets.image_datasets_p3D import (
     get_train_transform,
 )
 from flow_matching.models import UNetModel
-from flow_matching.sampler import PathSampler
 from flow_matching.solver import ModelWrapper, ODESolver
 from flow_matching.utils import model_size_summary, set_seed
-
+from flow_matching.discriminator import (
+    ConditionalDiscriminator2D,
+    discriminator_loss_wgan,
+    generator_loss_wgan,
+    gradient_penalty,
+    extract_oriented_slices,
+)
 try:
     from flow_matching.eval_3D import eval as run_eval, EvalConfig
 except Exception:
@@ -140,12 +146,34 @@ class ScriptArguments:
     loss_frac: float = 0.25            # fraction of timesteps to compute loss on (unrolled)
     detach_every: int = 0              # 0 disables; else detach z every N steps to save memory
 
+
     # NEW: resume + debug cadence
     resume: bool = False                   # <-- ADD
     eval_every: int = 10                   # <-- ADD (set 1 while debugging)
     save_every: int = 10                   # <-- ADD (set 1 while debugging)
 
-    grad_log_every: int = 0   # ✅ ADD THIS
+    grad_log_every: int = 0 
+
+    # -------- Adversarial training --------
+    disc_learning_rate: float = 2e-4
+    lambda_gp: float = 10.0
+    n_critic: int = 5
+
+    # Discriminator architecture
+    disc_base_channels: int = 64
+    disc_channel_multipliers: tuple[int, ...] = (1, 2, 4, 8)
+    disc_timestep_embedding_dim: int = 128
+    disc_timestep_model_dim: int = 128
+    disc_plane_embedding_dim: int = 128
+    disc_cond_hidden_dim: int = 256
+    disc_dropout: float = 0.0
+
+    # Slice extraction for adversarial loss
+    adv_slices_per_sample: int = 4
+    adv_slice_strategy: str = "stratified"   # random / uniform / stratified
+
+    # AMP
+    use_amp: bool = True
 
 def _find_resume_checkpoint(output_dir: Path) -> Path | None:
     """
@@ -197,172 +225,199 @@ def _load_checkpoint_maybe(
     return 0, 0
 
 # ---- 2D to 3D helpers ------------------------------------------- 
-def _expand_mask(M: torch.Tensor, C: int) -> torch.Tensor:
-    """
-    M: [B,1,D,H,W] -> [B,C,D,H,W]
-    """
-    if M.dim() != 5 or M.size(1) != 1:
-        raise ValueError(f"Expected M shape [B,1,D,H,W], got {tuple(M.shape)}")
-    return M.expand(-1, C, -1, -1, -1)
-
-
-def masked_mse(pred: torch.Tensor, target: torch.Tensor, M: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    pred, target: [B,C,D,H,W]
-    M: [B,1,D,H,W]
-    """
-    if pred.shape != target.shape:
-        raise ValueError(f"pred/target mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
-    mask = _expand_mask(M, pred.size(1))
-    diff2 = (pred - target) ** 2
-    num = (diff2 * mask).sum()
-    den = mask.sum().clamp_min(eps)
-    return num / den
-
-
-@torch.no_grad()
 def _pick_loss_indices(n_steps: int, loss_frac: float, device: torch.device) -> torch.Tensor:
-    """
-    Returns sorted indices of timesteps at which to compute loss.
-    Example: loss_frac=0.25 selects ~25% of steps.
-    """
-    loss_frac = float(loss_frac)
-    if not (0.0 < loss_frac <= 1.0):
-        raise ValueError("loss_frac must be in (0, 1].")
     k = max(1, int(round(loss_frac * n_steps)))
     idx = torch.randperm(n_steps, device=device)[:k]
     return torch.sort(idx).values
 
-
-def build_endpoints_from_p3d(Y: torch.Tensor, M: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def extract_real_observed_slices(
+    Y: torch.Tensor,
+    M: torch.Tensor,
+    plane_ids: torch.Tensor,
+    slices_per_sample: int,
+    strategy: str = "stratified",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Create the FM endpoints (x0, x1) for pseudo-3D masked supervision:
-      x0 = z ~ N(0,1)
-      x1 = M*Y + (1-M)*z   (fill = same z)
-    Returns: (x0, x1)
+    Extract real 2D observed slices from pseudo-volume targets.
+
+    Args:
+        Y: [B,C,D,H,W]
+        M: [B,1,D,H,W]
+        plane_ids: [B]
+        slices_per_sample: number of slices to extract per sample
+        strategy: currently only used if more observed slices than requested
+
+    Returns:
+        real_slices: [B*K,C,H,W]
+        plane_ids_out: [B*K]
+        slice_indices_out: [B*K]
+    """
+    if Y.dim() != 5 or M.dim() != 5:
+        raise ValueError("Expected Y [B,C,D,H,W] and M [B,1,D,H,W]")
+
+    B, C, D, H, W = Y.shape
+    device = Y.device
+
+    real_slices = []
+    out_plane_ids = []
+    out_slice_indices = []
+
+    for i in range(B):
+        pid = int(plane_ids[i].item())
+
+        if pid == 0:      # XY => observed along z
+            obs = torch.nonzero(M[i, 0].sum(dim=(1, 2)) > 0, as_tuple=False).flatten()
+        elif pid == 1:    # XZ => observed along y
+            obs = torch.nonzero(M[i, 0].sum(dim=(0, 2)) > 0, as_tuple=False).flatten()
+        elif pid == 2:    # YZ => observed along x
+            obs = torch.nonzero(M[i, 0].sum(dim=(0, 1)) > 0, as_tuple=False).flatten()
+        else:
+            raise ValueError(f"Unknown plane id {pid}")
+
+        if obs.numel() == 0:
+            continue
+
+        if obs.numel() <= slices_per_sample:
+            chosen = obs
+        else:
+            if strategy == "uniform":
+                pos = torch.linspace(0, obs.numel() - 1, slices_per_sample, device=device).long()
+                chosen = obs[pos]
+            elif strategy == "stratified":
+                stratum = obs.numel() / slices_per_sample
+                base = torch.arange(slices_per_sample, device=device, dtype=torch.float32) * stratum
+                offs = torch.rand(slices_per_sample, device=device) * stratum
+                pos = torch.clamp((base + offs).long(), max=obs.numel() - 1)
+                chosen = obs[pos]
+            else:  # random
+                perm = torch.randperm(obs.numel(), device=device)[:slices_per_sample]
+                chosen = obs[perm]
+
+        for idx in chosen.tolist():
+            if pid == 0:
+                sl = Y[i, :, idx, :, :]
+            elif pid == 1:
+                sl = Y[i, :, :, idx, :]
+            else:
+                sl = Y[i, :, :, :, idx]
+
+            real_slices.append(sl)
+            out_plane_ids.append(pid)
+            out_slice_indices.append(idx)
+
+    if len(real_slices) == 0:
+        raise RuntimeError("No observed real slices could be extracted.")
+
+    return (
+        torch.stack(real_slices, dim=0),
+        torch.tensor(out_plane_ids, device=device, dtype=torch.long),
+        torch.tensor(out_slice_indices, device=device, dtype=torch.long),
+    )
+
+def policy_generate_random_t(
+    flow: torch.nn.Module,
+    Y: torch.Tensor,
+    M: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    One-step policy:
+      x0 = noise
+      x1 = pseudo target on observed voxels, noise elsewhere
+      x_t = linear interpolation at random t
+      fake_volume = x_t + v_theta(x_t, t)
+
+    Returns:
+      fake_volume: [B,C,D,H,W]
+      t: [B]
     """
     z = torch.randn_like(Y)
     x0 = z
     x1 = M * Y + (1.0 - M) * z
-    return x0, x1
+
+    t = torch.rand(Y.size(0), device=device, dtype=Y.dtype)
+    t_view = t[:, None, None, None, None]
+    x_t = (1.0 - t_view) * x0 + t_view * x1
+
+    v = flow(t=t, x=x_t, y=None)
+    fake_volume = x_t + v
+    return fake_volume, t
 
 
-def policy_fm_random_t(
-    flow: torch.nn.Module,
-    path_sampler: PathSampler,
-    Y: torch.Tensor,
-    M: torch.Tensor,
-    orient_id: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Policy 1 (default FM):
-    - sample random t
-    - build (x_t, dx_t) from PathSampler using endpoints (x0,x1)
-    - regress v_theta(x_t,t) to dx_t with masked MSE
-    """
-    x0, x1 = build_endpoints_from_p3d(Y, M)
-    t = torch.rand(x1.size(0), device=device, dtype=x1.dtype)
-    x_t, dx_t = path_sampler.sample(x0, x1, t)
-
-    vf_t = flow(t=t, x=x_t, y=None)
-    return masked_mse(vf_t.float(), dx_t.float(), M.float())
-
-
-def policy_fm_unrolled(
-    flow: torch.nn.Module,
-    path_sampler: PathSampler,
-    Y: torch.Tensor,
-    M: torch.Tensor,
-    orient_id: torch.Tensor,
-    device: torch.device,
-    *,
-    unroll_steps: int,
-    unroll_dt: float,
-    loss_frac: float,
-    detach_every: int = 0,
-) -> torch.Tensor:
-    """
-    Policy 2 (unrolled FM training):
-    - Fix (Y,M,orient) and endpoints (x0,x1) for the whole iteration
-    - Unroll z with Euler updates: z <- z + dt * v_theta(z,t)
-    - Compute masked FM regression loss only on a random subset of timesteps
-      (targets dx_t are computed from (x0,x1,t) via PathSampler)
-    - Return averaged loss over selected steps
-    """
-    if unroll_steps <= 0:
-        raise ValueError("unroll_steps must be > 0.")
-    if unroll_dt <= 0:
-        raise ValueError("unroll_dt must be > 0.")
-
-    x0, x1 = build_endpoints_from_p3d(Y, M)
-
-    # time grid for training unroll (you can flip direction if your sampler assumes opposite)
-    # Keep it consistent with your existing code that uses torch.linspace(0,1,...)
-    time_grid = torch.linspace(0.0, 1.0, unroll_steps, device=device, dtype=x1.dtype)
-
-    # Choose which steps contribute to loss this iteration
-    loss_idx = _pick_loss_indices(unroll_steps, loss_frac, device=device)
-    loss_set = set(loss_idx.tolist())
-
-    z = x0  # start from noise endpoint
-
-    total_loss = 0.0
-    count = 0
-
-    for k, t_k in enumerate(time_grid):
-        # Optionally truncate BPTT to save memory
-        if detach_every and (k > 0) and (k % detach_every == 0):
-            z = z.detach()
-
-        t_batch = t_k.expand(z.size(0))  # [B]
-
-        vf = flow(t=t_batch, x=z, y=None).to(dtype=z.dtype)
-
-        if k in loss_set:
-            # Target velocity at this time from the probability path defined by (x0,x1)
-            _, dx_t = path_sampler.sample(x0, x1, t_batch)
-            step_loss = masked_mse(vf, dx_t, M)
-            total_loss = total_loss + step_loss
-            count += 1
-
-        # Euler step: feed-forward the generated sample
-        z = z + (unroll_dt * vf)
-
-    if count == 0:
-        # should never happen due to max(1,...) in _pick_loss_indices
-        raise RuntimeError("No timesteps selected for loss.")
-    return total_loss / count
-
-
-def compute_loss_from_policy(
+def policy_generate_unrolled(
     args,
     flow: torch.nn.Module,
-    path_sampler: PathSampler,
     Y: torch.Tensor,
     M: torch.Tensor,
-    orient_id: torch.Tensor,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Policy switch wrapper: returns a scalar loss.
+    Unrolled generator trajectory.
+    Returns selected intermediate fake volumes and their timesteps.
+
+    Returns:
+      fake_volumes: [B*K,C,D,H,W]
+      t_out: [B*K]
     """
+    z = torch.randn_like(Y)
+    z_cur = z
+
+    time_grid = torch.linspace(0.0, 1.0, args.unroll_steps, device=device, dtype=Y.dtype)
+    chosen_idx = _pick_loss_indices(args.unroll_steps, args.loss_frac, device)
+    chosen_set = set(chosen_idx.tolist())
+
+    kept_vols = []
+    kept_t = []
+
+    for k, t_k in enumerate(time_grid):
+        if args.detach_every and (k > 0) and (k % args.detach_every == 0):
+            z_cur = z_cur.detach()
+
+        t_batch = t_k.expand(Y.size(0))
+        v = flow(t=t_batch, x=z_cur, y=None)
+        z_cur = z_cur + args.unroll_dt * v
+
+        if k in chosen_set:
+            kept_vols.append(z_cur)
+            kept_t.append(t_batch)
+
+    if len(kept_vols) == 0:
+        raise RuntimeError("No unrolled steps selected.")
+
+    fake_volumes = torch.cat(kept_vols, dim=0)   # [B*K,C,D,H,W]
+    t_out = torch.cat(kept_t, dim=0)             # [B*K]
+    return fake_volumes, t_out
+
+
+def generate_fake_volumes_from_policy(
+    args,
+    flow: torch.nn.Module,
+    Y: torch.Tensor,
+    M: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      fake_volumes: [B',C,D,H,W]
+      fake_t: [B']
+      fake_plane_ids: [B']
+    """
+    plane_ids = torch.randint(
+        low=0,
+        high=3,
+        size=(Y.size(0),),
+        device=device,
+        dtype=torch.long,
+    )
+
     if args.train_policy == "fm_random_t":
-        return policy_fm_random_t(flow, path_sampler, Y, M, orient_id, device)
+        fake_volumes, fake_t = policy_generate_random_t(flow, Y, M, device)
+        return fake_volumes, fake_t, plane_ids
 
     if args.train_policy == "fm_unrolled":
-        return policy_fm_unrolled(
-            flow,
-            path_sampler,
-            Y,
-            M,
-            orient_id,
-            device,
-            unroll_steps=args.unroll_steps,
-            unroll_dt=args.unroll_dt,
-            loss_frac=args.loss_frac,
-            detach_every=args.detach_every,
-        )
+        fake_volumes, fake_t = policy_generate_unrolled(args, flow, Y, M, device)
+        fake_plane_ids = plane_ids.repeat(int(fake_volumes.size(0) // Y.size(0)))
+        return fake_volumes, fake_t, fake_plane_ids
 
     raise ValueError(f"Unknown train_policy: {args.train_policy}")
 # -----------------------------------------------------------------
@@ -450,12 +505,33 @@ def train(args: ScriptArguments):
         class_cond=class_cond,
         dims=3,
         attention_resolutions="999999",
+        use_checkpoint=True,
+        use_fp16=False,
+        dropout=0.0,
+        resblock_updown=False,
+        use_scale_shift_norm=False,
     ).to(device)
 
-    path_sampler = PathSampler(sigma_min=args.sigma_min)
+    disc = ConditionalDiscriminator2D(
+        in_channels=input_shape[0],
+        base_channels=args.disc_base_channels,
+        channel_multipliers=args.disc_channel_multipliers,
+        timestep_embedding_dim=args.disc_timestep_embedding_dim,
+        timestep_model_dim=args.disc_timestep_model_dim,
+        plane_embedding_dim=args.disc_plane_embedding_dim,
+        cond_hidden_dim=args.disc_cond_hidden_dim,
+        num_planes=3,
+        dropout=args.disc_dropout,
+    ).to(device)
 
-    optimizer = torch.optim.AdamW(flow.parameters(), lr=args.learning_rate)
+    optimizer_G = torch.optim.AdamW(flow.parameters(), lr=args.learning_rate, betas=(0.0, 0.99))
+    optimizer_D = torch.optim.AdamW(disc.parameters(), lr=args.disc_learning_rate, betas=(0.0, 0.99))
+
+    scaler_G = GradScaler("cuda", enabled=(args.use_amp and device.type == "cuda"))
+    scaler_D = GradScaler("cuda", enabled=(args.use_amp and device.type == "cuda"))
+
     model_size_summary(flow)
+    model_size_summary(disc)
 
     def save_sample_grid(epoch_num: int) -> Tensor:
         """Generate and save a 5x5 grid of samples for quick inspection."""
@@ -541,25 +617,90 @@ def train(args: ScriptArguments):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1:3d}/{args.n_epochs}")
 
         for Y, M, orient_id in pbar:
-            Y = Y.to(device)                 # [B,C,D,H,W]
-            M = M.to(device)                 # [B,1,D,H,W]
-            orient_id = orient_id.to(device) # [B]
+            Y = Y.to(device, non_blocking=True)                 # [B,C,D,H,W]
+            M = M.to(device, non_blocking=True)                 # [B,1,D,H,W]
+            orient_id = orient_id.to(device, non_blocking=True) # [B]
+            # 1) Discriminator updates
+            for _ in range(args.n_critic):
+                optimizer_D.zero_grad(set_to_none=True)
+                with autocast(device_type=device.type, enabled=(args.use_amp and device.type == "cuda")):
+                    fake_volumes, fake_t, fake_plane_ids = generate_fake_volumes_from_policy(args, flow, Y, M, device)
+                    fake_slices, fake_plane_ids, fake_slice_idx = extract_oriented_slices(
+                        volumes=fake_volumes,
+                        plane_ids=fake_plane_ids,
+                        slices_per_sample=args.adv_slices_per_sample,
+                        strategy=args.adv_slice_strategy,
+                    )
+                    real_slices, real_plane_ids, real_slice_idx = extract_real_observed_slices(
+                        Y=Y,
+                        M=M,
+                        plane_ids=orient_id,
+                        slices_per_sample=args.adv_slices_per_sample,
+                        strategy=args.adv_slice_strategy,
+                    )
+                    # Timestep conditioning:
+                    # real slices come from actual observed planes, so use t=1
+                    real_t = torch.ones(real_slices.size(0), device=device, dtype=Y.dtype)
+                    # fake_t is per fake volume; repeat each t for extracted slices
+                    repeat_factor = args.adv_slices_per_sample
+                    fake_t_slices = fake_t.repeat_interleave(repeat_factor)
+                    real_scores = disc(real_slices, timesteps=real_t, plane_ids=real_plane_ids)
+                    fake_scores = disc(fake_slices.detach(), timesteps=fake_t_slices, plane_ids=fake_plane_ids)
+                    d_loss = discriminator_loss_wgan(real_scores, fake_scores)
+                # GP in full precision
+                gp = gradient_penalty(
+                    discriminator=disc,
+                    real_samples=real_slices.float(),
+                    fake_samples=fake_slices.detach().float(),
+                    timesteps=fake_t_slices.float(),
+                    plane_ids=fake_plane_ids,
+                    lambda_gp=args.lambda_gp,
+                )
+                loss_D_total = d_loss.float() + gp.float()
+                scaler_D.scale(loss_D_total).backward()
+                scaler_D.unscale_(optimizer_D)
+                torch.nn.utils.clip_grad_norm_(disc.parameters(), max_norm=5.0)
+                scaler_D.step(optimizer_D)
+                scaler_D.update()
+            # 2) Generator update
+            # --------------------------------------------------
+            optimizer_G.zero_grad(set_to_none=True)
+            with autocast(device_type=device.type, enabled=(args.use_amp and device.type == "cuda")):
+                fake_volumes, fake_t, fake_plane_ids = generate_fake_volumes_from_policy(
+                    args, flow, Y, M, device
+                )
 
-            optimizer.zero_grad(set_to_none=True)
+                fake_slices, fake_plane_ids, fake_slice_idx = extract_oriented_slices(
+                    volumes=fake_volumes,
+                    plane_ids=fake_plane_ids,
+                    slices_per_sample=args.adv_slices_per_sample,
+                    strategy=args.adv_slice_strategy,
+                )
 
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = compute_loss_from_policy(args, flow, path_sampler, Y, M, orient_id, device)
+                fake_t_slices = fake_t.repeat_interleave(args.adv_slices_per_sample)
+                fake_scores = disc(fake_slices, timesteps=fake_t_slices, plane_ids=fake_plane_ids)
+                loss_G = generator_loss_wgan(fake_scores)
 
-            experiment.log_metric("train_loss", float(loss.item()), step=global_step)
-
-            loss.backward()
+            scaler_G.scale(loss_G).backward()
+            scaler_G.unscale_(optimizer_G)
             torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler_G.step(optimizer_G)
+            scaler_G.update()
+
+            experiment.log_metric("train/loss_G", float(loss_G.item()), step=global_step)
+            experiment.log_metric("train/loss_D", float(d_loss.item()), step=global_step)
+            experiment.log_metric("train/gp", float(gp.item()), step=global_step)
 
             if args.grad_log_every and (global_step % args.grad_log_every == 0):
                 log_comet_gradients(experiment, flow, step=global_step)
 
-            pbar.set_postfix({"loss": float(loss.item())})
+            pbar.set_postfix(
+                {
+                    "loss_G": float(loss_G.item()),
+                    "loss_D": float(d_loss.item()),
+                    "gp": float(gp.item()),
+                }
+            )
             global_step += 1
 
         # --- end of each epoch ---
@@ -573,7 +714,9 @@ def train(args: ScriptArguments):
                     "epoch": epoch_num,
                     "global_step": global_step,
                     "model_state_dict": flow.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
+                    "optimizer_G_state_dict": optimizer_G.state_dict(),
+                    "optimizer_D_state_dict": optimizer_D.state_dict(),
+                    "disc_state_dict": disc.state_dict(),
                     "args": vars(args),
                     "class_cond": class_cond,
                     "num_classes": num_classes,
